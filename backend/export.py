@@ -28,11 +28,13 @@ router = APIRouter(prefix="/api/boards", tags=["export"])
 def _bbox(shape: Dict[str, Any]) -> Tuple[float, float, float, float]:
     x = float(shape.get("x") or 0)
     y = float(shape.get("y") or 0)
-    if shape.get("kind") == "path" and shape.get("points"):
+    # path/line/arrow 的 points 与前端一致, 均为相对 (x, y) 的偏移
+    # (手绘落笔点为 [0,0]), 真实包围盒需把基准 x/y 加回去。
+    if shape.get("kind") in ("path", "line", "arrow") and shape.get("points"):
         pts = shape["points"]
-        xs = [p[0] for p in pts] + [x]
-        ys = [p[1] for p in pts] + [y]
-        return min(xs), min(ys), max(xs), max(ys)
+        xs = [float(p[0]) for p in pts]
+        ys = [float(p[1]) for p in pts]
+        return x + min(xs), y + min(ys), x + max(xs), y + max(ys)
     return x, y, x + float(shape.get("w") or 0), y + float(shape.get("h") or 0)
 
 
@@ -132,10 +134,13 @@ def render_svg(shapes: List[Dict[str, Any]], background: str = "#ffffff",
                 f'<rect width="800" height="600" fill="{background}"/>'
                 '<text x="400" y="300" text-anchor="middle" fill="#9aa4b5" '
                 'font-size="20">空白板</text></svg>')
-    x0 = min(_bbox(s)[0] for s in alive) - padding
-    y0 = min(_bbox(s)[1] for s in alive) - padding
-    x1 = max(_bbox(s)[2] for s in alive) + padding
-    y1 = max(_bbox(s)[3] for s in alive) + padding
+    # edge 自身的 x/y/w/h 恒为 0(几何由两端节点锚点决定), 不参与整体边界,
+    # 否则会把原点 (0,0) 卷进来, 画布远离原点时内容被错误缩放/挤到角落。
+    bounded = [s for s in alive if s.get("kind") != "edge"] or alive
+    x0 = min(_bbox(s)[0] for s in bounded) - padding
+    y0 = min(_bbox(s)[1] for s in bounded) - padding
+    x1 = max(_bbox(s)[2] for s in bounded) + padding
+    y1 = max(_bbox(s)[3] for s in bounded) + padding
     width, height = max(1, x1 - x0), max(1, y1 - y0)
     by_id = {s["id"]: s for s in alive}
 

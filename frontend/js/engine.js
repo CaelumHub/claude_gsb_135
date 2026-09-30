@@ -784,7 +784,10 @@ export class BoardEngine {
       ctx.fillText('空白板', canvas.width / 2, canvas.height / 2);
       return canvas;
     }
-    const b = shapesBbox(shapes);
+    // edge 的 x/y/w/h 恒为 0, 几何由两端节点决定, 不参与整体边界,
+    // 否则会把原点 (0,0) 卷进来, 内容远离原点时导出图被错误缩放。
+    const bounded = shapes.filter((s) => s.kind !== 'edge');
+    const b = shapesBbox(bounded.length ? bounded : shapes);
     const bw = Math.max(1, b.x1 - b.x0) + padding * 2;
     const bh = Math.max(1, b.y1 - b.y0) + padding * 2;
     let k = scale;
