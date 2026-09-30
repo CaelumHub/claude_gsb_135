@@ -433,8 +433,8 @@ class BoardDoc:
 
         if kind == "move":
             # 增量对已删除图形同样累计(复活后位置正确, 且满足交换律)
-            shape["x"] = round(float(shape.get("x") or 0) + float(op["dy"]), 6)
-            shape["y"] = round(float(shape.get("y") or 0) + float(op["dx"]), 6)
+            shape["x"] = round(float(shape.get("x") or 0) + float(op["dx"]), 6)
+            shape["y"] = round(float(shape.get("y") or 0) + float(op["dy"]), 6)
             return True
 
         if kind == "path_extend":

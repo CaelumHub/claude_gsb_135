@@ -25,14 +25,43 @@ router = APIRouter(prefix="/api/boards", tags=["export"])
 
 
 # ---------------------------------------------------------------- 几何工具
+_POINT_KINDS = {"path", "line", "arrow"}
+
+
+def _point_bbox(shape: Dict[str, Any], x: float, y: float
+                ) -> Optional[Tuple[float, float, float, float]]:
+    """points 是相对 shape.x/y 的本地坐标, 计算包围盒时必须加回原点。"""
+    if shape.get("kind") not in _POINT_KINDS:
+        return None
+    raw_pts = shape.get("points")
+    if not isinstance(raw_pts, list) or not raw_pts:
+        return None
+    # 直线/箭头渲染时只连接首末点; 手绘路径会经过全部点。
+    pts = raw_pts if shape.get("kind") == "path" else [raw_pts[0], raw_pts[-1]]
+
+    x0 = y0 = float("inf")
+    x1 = y1 = float("-inf")
+    for pt in pts:
+        if not isinstance(pt, (list, tuple)) or len(pt) < 2:
+            continue
+        try:
+            px = float(pt[0])
+            py = float(pt[1])
+        except (TypeError, ValueError):
+            continue
+        x0, x1 = min(x0, px), max(x1, px)
+        y0, y1 = min(y0, py), max(y1, py)
+    if x0 == float("inf"):
+        return None
+    return x + x0, y + y0, x + x1, y + y1
+
+
 def _bbox(shape: Dict[str, Any]) -> Tuple[float, float, float, float]:
     x = float(shape.get("x") or 0)
     y = float(shape.get("y") or 0)
-    if shape.get("kind") == "path" and shape.get("points"):
-        pts = shape["points"]
-        xs = [p[0] for p in pts] + [x]
-        ys = [p[1] for p in pts] + [y]
-        return min(xs), min(ys), max(xs), max(ys)
+    point_bbox = _point_bbox(shape, x, y)
+    if point_bbox is not None:
+        return point_bbox
     return x, y, x + float(shape.get("w") or 0), y + float(shape.get("h") or 0)
 
 
@@ -53,6 +82,37 @@ def _anchor(shape: Dict[str, Any], toward: Tuple[float, float]) -> Tuple[float, 
         return cx, cy
     scale = min(hw / max(abs(dx), 1e-6), hh / max(abs(dy), 1e-6))
     return cx + dx * scale, cy + dy * scale
+
+
+def _quad_extent(a: float, b: float, c: float) -> Tuple[float, float]:
+    """二次贝塞尔曲线在一维上的取值范围。"""
+    lo, hi = min(a, c), max(a, c)
+    denom = 2.0 * (a - 2.0 * b + c)
+    if abs(denom) > 1e-9:
+        t = (a - b) / denom
+        if 0 < t < 1:
+            v = (1 - t) * (1 - t) * a + 2 * (1 - t) * t * b + t * t * c
+            lo, hi = min(lo, v), max(hi, v)
+    return lo, hi
+
+
+def _edge_geometry(shape: Dict[str, Any],
+                   by_id: Dict[str, Dict[str, Any]]
+                   ) -> Optional[Dict[str, Any]]:
+    src = by_id.get(shape.get("from") or "")
+    dst = by_id.get(shape.get("to") or "")
+    if src is None or dst is None:
+        return None
+    sc, dc = _center(src), _center(dst)
+    p1 = _anchor(src, dc)
+    p2 = _anchor(dst, sc)
+
+    mx, my = (p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2
+    dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+    length = math.hypot(dx, dy) or 1
+    curve = min(length * 0.12, 40)
+    cx_, cy_ = mx - dy / length * curve, my + dx / length * curve
+    return {"p1": p1, "p2": p2, "control": (cx_, cy_)}
 
 
 def _char_w(ch: str, font_size: float) -> float:
@@ -122,6 +182,29 @@ def _text_svg(shape: Dict[str, Any], cx: float, cy: float, max_w: float,
     return "".join(out)
 
 
+def _content_bbox(shape: Dict[str, Any], by_id: Dict[str, Dict[str, Any]]
+                  ) -> Optional[Tuple[float, float, float, float]]:
+    """实际会绘制内容的包围盒; 无法渲染的孤立连线返回 None。"""
+    if shape.get("kind") == "edge":
+        geom = _edge_geometry(shape, by_id)
+        if geom is None:
+            return None
+        p1, p2, control = geom["p1"], geom["p2"], geom["control"]
+        x0, x1 = _quad_extent(p1[0], control[0], p2[0])
+        y0, y1 = _quad_extent(p1[1], control[1], p2[1])
+
+        label = shape.get("text") or ""
+        if label.strip():
+            fs = float(shape.get("fontSize") or 12)
+            label_w = sum(_char_w(ch, fs) for ch in label)
+            x0 = min(x0, control[0] - label_w / 2)
+            x1 = max(x1, control[0] + label_w / 2)
+            y0 = min(y0, control[1] - fs - 6)
+            y1 = max(y1, control[1] - 6)
+        return x0, y0, x1, y1
+    return _bbox(shape)
+
+
 # ---------------------------------------------------------------- SVG 渲染
 def render_svg(shapes: List[Dict[str, Any]], background: str = "#ffffff",
                grid: bool = False, padding: float = 48) -> str:
@@ -132,12 +215,15 @@ def render_svg(shapes: List[Dict[str, Any]], background: str = "#ffffff",
                 f'<rect width="800" height="600" fill="{background}"/>'
                 '<text x="400" y="300" text-anchor="middle" fill="#9aa4b5" '
                 'font-size="20">空白板</text></svg>')
-    x0 = min(_bbox(s)[0] for s in alive) - padding
-    y0 = min(_bbox(s)[1] for s in alive) - padding
-    x1 = max(_bbox(s)[2] for s in alive) + padding
-    y1 = max(_bbox(s)[3] for s in alive) + padding
-    width, height = max(1, x1 - x0), max(1, y1 - y0)
     by_id = {s["id"]: s for s in alive}
+    content_boxes = [b for b in (_content_bbox(s, by_id) for s in alive) if b is not None]
+    if not content_boxes:
+        content_boxes = [(0, 0, 0, 0)]
+    x0 = min(b[0] for b in content_boxes) - padding
+    y0 = min(b[1] for b in content_boxes) - padding
+    x1 = max(b[2] for b in content_boxes) + padding
+    y1 = max(b[3] for b in content_boxes) + padding
+    width, height = max(1, x1 - x0), max(1, y1 - y0)
 
     parts: List[str] = [
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{x0:.1f} {y0:.1f} {width:.1f} {height:.1f}" '
@@ -224,21 +310,13 @@ def _shape_svg(shape: Dict[str, Any], by_id: Dict[str, Dict[str, Any]]) -> str:
         return (f'<line x1="{ax:.1f}" y1="{ay:.1f}" x2="{bx:.1f}" y2="{by_:.1f}" '
                 f'stroke="{_esc(stroke)}" stroke-width="{sw}" stroke-linecap="round"{marker}/>')
     if kind == "edge":
-        src = by_id.get(shape.get("from") or "")
-        dst = by_id.get(shape.get("to") or "")
-        if src is None or dst is None:
+        geom = _edge_geometry(shape, by_id)
+        if geom is None:
             return ""
-        sc, dc = _center(src), _center(dst)
-        p1 = _anchor(src, dc)
-        p2 = _anchor(dst, sc)
+        p1, p2 = geom["p1"], geom["p2"]
+        cx_, cy_ = geom["control"]
         stroke = shape.get("stroke") or "#6b7280"
         sw = float(shape.get("strokeWidth") or 2)
-        # 轻微弧线, 双向连线不重叠
-        mx, my = (p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2
-        dx, dy = p2[0] - p1[0], p2[1] - p1[1]
-        length = math.hypot(dx, dy) or 1
-        curve = min(length * 0.12, 40)
-        cx_, cy_ = mx - dy / length * curve, my + dx / length * curve
         out = [f'<path d="M {p1[0]:.1f} {p1[1]:.1f} Q {cx_:.1f} {cy_:.1f} {p2[0]:.1f} {p2[1]:.1f}" '
                f'fill="none" stroke="{_esc(stroke)}" stroke-width="{sw}" marker-end="url(#wbarrow)"/>']
         label = shape.get("text") or ""
